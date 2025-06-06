@@ -25,7 +25,7 @@ if (args.length === 0) {
 
 // Normalize all paths consistently
 function normalizePath(p: string): string {
-  return path.normalize(p).toLowerCase()
+  return path.normalize(p)
 }
 
 function expandHome(filepath: string): string {
@@ -35,18 +35,29 @@ function expandHome(filepath: string): string {
   return filepath
 }
 
-// Store allowed directories in normalized form
-const vaultDirectories = [normalizePath(path.resolve(expandHome(args[0])))]
+// Store allowed directories in normalized form, resolving symlinks
+const vaultDirectories: string[] = []
+const originalVaultPaths: string[] = []
 
-// Validate that all directories exist and are accessible
+// Validate that all directories exist and are accessible, and resolve real paths
 await Promise.all(
   args.map(async (dir) => {
     try {
-      const stats = await fs.stat(dir)
+      const expandedDir = expandHome(dir)
+      const resolvedDir = path.resolve(expandedDir)
+      const stats = await fs.stat(resolvedDir)
       if (!stats.isDirectory()) {
         console.error(`Error: ${dir} is not a directory`)
         process.exit(1)
       }
+
+      // Store the original normalized path (may be symlink)
+      originalVaultPaths.push(normalizePath(resolvedDir))
+
+      // Get the real path (resolves symlinks) and store it
+      const realPath = await fs.realpath(resolvedDir)
+      const normalizedRealPath = normalizePath(realPath)
+      vaultDirectories.push(normalizedRealPath)
     } catch (error) {
       console.error(`Error accessing directory ${dir}:`, error)
       process.exit(1)
@@ -69,15 +80,21 @@ async function validatePath(requestedPath: string): Promise<string> {
 
   const normalizedRequested = normalizePath(absolute)
 
-  // Check if path is within allowed directories
-  const isAllowed = vaultDirectories.some((dir) =>
+  // Check if path is within allowed directories (original symlink paths or real paths)
+  const isAllowedInOriginal = originalVaultPaths.some((dir) =>
     normalizedRequested.startsWith(dir)
   )
+  const isAllowedInReal = vaultDirectories.some((dir) =>
+    normalizedRequested.startsWith(dir)
+  )
+  const isAllowed = isAllowedInOriginal || isAllowedInReal
+
   if (!isAllowed) {
     throw new Error(
-      `Access denied - path outside allowed directories: ${absolute} not in ${vaultDirectories.join(
-        ", "
-      )}`
+      `Access denied - path outside allowed directories: ${absolute} not in ${[
+        ...originalVaultPaths,
+        ...vaultDirectories,
+      ].join(", ")}`
     )
   }
 
@@ -182,7 +199,9 @@ async function searchNotes(query: string): Promise<string[]> {
     }
   }
 
-  await Promise.all(vaultDirectories.map((dir) => search(dir, dir)))
+  await Promise.all(
+    originalVaultPaths.map((dir, index) => search(vaultDirectories[index], dir))
+  )
   return results
 }
 
@@ -224,8 +243,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const results = await Promise.all(
           parsed.data.paths.map(async (filePath: string) => {
             try {
+              // Use the original symlink path for file operations
               const validPath = await validatePath(
-                path.join(vaultDirectories[0], filePath)
+                path.join(originalVaultPaths[0], filePath)
               )
               const content = await fs.readFile(validPath, "utf-8")
               return `${filePath}:\n${content}\n`
